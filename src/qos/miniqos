@@ -1,0 +1,85 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2019 xiaobo.ou@jaguarwave.com
+
+START=99
+
+num=1
+IDEV=$(uci -q get miniqos.@dev[0].dev_lan)
+echo ${IDEV:="br-lan"}
+ODEV=$(uci -q get miniqos.@dev[0].dev_wan)
+echo ${ODEV:="br-lan"}
+
+init() {
+	iptables -t mangle -F QOS_postrouting
+	iptables -t mangle -F QOS_prerouting
+
+	iptables -t mangle -N QOS_postrouting
+	iptables -t mangle -N QOS_prerouting
+
+	iptables -t mangle -D POSTROUTING -j QOS_postrouting
+	iptables -t mangle -D PREROUTING -j QOS_prerouting
+
+	tc qdisc del dev $ODEV root 2>/dev/null
+	tc qdisc del dev $IDEV root 2>/dev/null
+
+	tc qdisc add dev $ODEV root handle 10: htb default 256
+	tc qdisc add dev $IDEV root handle 10: htb default 256
+
+	tc class add dev $ODEV parent 10: classid 10:1 htb rate 102400mbit ceil 102400mbit
+	tc class add dev $IDEV parent 10: classid 10:1 htb rate 102400mbit ceil 102400mbit
+}
+
+rule() {
+
+	MUPLOAD=$2mbit
+	MDOWNLOAD=$3mbit
+
+	tc class add dev $ODEV parent 10:1 classid 10:1$4 htb rate 20mbit ceil $MUPLOAD prio 1
+	tc qdisc add dev $ODEV parent 10:1$4 handle $4: pfifo
+	tc filter add dev $ODEV parent 10: protocol ip prio 100 handle 1$4 fw classid 10:2$4
+
+	tc class add dev $IDEV parent 10:1 classid 10:2$4 htb rate 20mbit ceil $MDOWNLOAD prio 1
+	tc qdisc add dev $IDEV parent 10:2$4 handle $4: pfifo
+	tc filter add dev $IDEV parent 10: protocol ip prio 100 handle 2$4 fw classid 10:2$4
+
+	iptables -t mangle -A QOS_postrouting -d $1 -j MARK --set-mark 2$4
+	iptables -t mangle -A QOS_postrouting -d $1 -j RETURN
+
+	iptables -t mangle -A QOS_prerouting -s $1 -j MARK --set-mark 2$4
+	iptables -t mangle -A QOS_prerouting -s $1 -j RETURN
+}
+
+foreach_ip_list() {
+
+	num=`expr $num + 1`
+	config_get mac $1 mac
+	config_get upload $1 upload "102400"
+	config_get download $1 download "102400"
+	rule $mac $upload $download $num
+
+}
+
+start() {
+	[ ! -f /etc/config/miniqos ] && return
+
+	enabled=$(uci -q get miniqos.@dev[0].enabled)
+	[ $enabled != 1 ] && return
+
+	init
+	config_load miniqos
+	config_foreach foreach_ip_list mac
+	iptables -t mangle -A POSTROUTING -j QOS_postrouting
+	iptables -t mangle -A PREROUTING -j QOS_prerouting
+}
+
+stop() {
+
+	iptables -t mangle -F QOS_postrouting
+	iptables -t mangle -F QOS_prerouting
+
+	iptables -t mangle -D POSTROUTING -j QOS_postrouting
+	iptables -t mangle -D PREROUTING -j QOS_prerouting
+
+	tc qdisc del dev $ODEV root 2>/dev/null
+	tc qdisc del dev $IDEV root 2>/dev/null
+}
